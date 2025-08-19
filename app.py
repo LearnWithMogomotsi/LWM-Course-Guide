@@ -20,7 +20,9 @@ class AppConfig:
         self.api_key = os.getenv("GOOGLE_API_KEY")
         self.max_requests_per_hour = 10
         self.max_requests_per_day = 50
-        self.db_path = "user_data.db"
+        # Use Railway's ephemeral filesystem safely
+        self.db_path = os.path.join(os.getcwd(), "user_data.db")
+        self.is_production = os.getenv("RAILWAY_ENVIRONMENT") is not None
         
     def validate_api_key(self):
         if not self.api_key:
@@ -28,6 +30,9 @@ class AppConfig:
         return True
 
 config = AppConfig()
+
+# Ensure database directory exists
+os.makedirs(os.path.dirname(config.db_path) if os.path.dirname(config.db_path) else '.', exist_ok=True)
 
 # Database setup for rate limiting and basic analytics
 def init_database():
@@ -750,7 +755,7 @@ def create_legal_footer():
     """)
 
 # Main UI with enhanced security and compliance
-with gr.Blocks(theme=gr.themes.Soft(), title="LWM Course Guide - Secure") as demo:
+with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Secure") as demo:
     # Session state
     state = gr.State([])
     email_captured = gr.State(False)
@@ -1045,11 +1050,11 @@ with gr.Blocks(theme=gr.themes.Soft(), title="LWM Course Guide - Secure") as dem
         outputs=[bot_reply]
     )
 
-# Launch configuration with security settings
+# Launch configuration with Railway-compatible settings
 if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=int(os.environ.get("PORT", 7860)),  # Fixed for Railway
         share=False,  # Set to True only for testing
         auth=None,  # Add authentication if needed
         ssl_verify=True,
