@@ -1,4 +1,4 @@
-# app.py - Railway PostgreSQL Integration
+# app.py - Main Application
 import google.generativeai as genai
 from dotenv import load_dotenv
 import gradio as gr
@@ -8,16 +8,8 @@ import json
 import hashlib
 import time
 from datetime import datetime, timedelta
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import psycopg2.pool
+import sqlite3
 import uuid
-import logging
-from urllib.parse import urlparse
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -28,34 +20,9 @@ class AppConfig:
         self.api_key = os.getenv("GOOGLE_API_KEY")
         self.max_requests_per_hour = 10
         self.max_requests_per_day = 50
+        # Use Railway's ephemeral filesystem safely
+        self.db_path = os.path.join(os.getcwd(), "user_data.db")
         self.is_production = os.getenv("RAILWAY_ENVIRONMENT") is not None
-        
-        # Railway PostgreSQL connection
-        self.database_url = os.getenv("DATABASE_URL")
-        if not self.database_url:
-            # Fallback for Railway auto-provided variables
-            db_host = os.getenv("PGHOST")
-            db_port = os.getenv("PGPORT", "5432")
-            db_name = os.getenv("PGDATABASE")
-            db_user = os.getenv("PGUSER")
-            db_password = os.getenv("PGPASSWORD")
-            
-            if all([db_host, db_name, db_user, db_password]):
-                self.database_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-        
-        # Parse database URL
-        if self.database_url:
-            parsed = urlparse(self.database_url)
-            self.db_config = {
-                'host': parsed.hostname,
-                'port': parsed.port or 5432,
-                'database': parsed.path[1:],  # Remove leading /
-                'user': parsed.username,
-                'password': parsed.password,
-                'sslmode': 'require' if self.is_production else 'prefer'
-            }
-        else:
-            raise ValueError("PostgreSQL connection details not found")
         
     def validate_api_key(self):
         if not self.api_key:
@@ -64,420 +31,128 @@ class AppConfig:
 
 config = AppConfig()
 
-# Database connection pool
-try:
-    connection_pool = psycopg2.pool.SimpleConnectionPool(
-        minconn=1,
-        maxconn=20,
-        **config.db_config
-    )
-    logger.info("✅ PostgreSQL connection pool created successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to create connection pool: {e}")
-    connection_pool = None
+# Ensure database directory exists
+os.makedirs(os.path.dirname(config.db_path) if os.path.dirname(config.db_path) else '.', exist_ok=True)
 
-def get_db_connection():
-    """Get database connection from pool"""
-    if connection_pool:
-        try:
-            return connection_pool.getconn()
-        except Exception as e:
-            logger.error(f"Failed to get connection: {e}")
-            return None
-    return None
-
-def return_db_connection(conn):
-    """Return connection to pool"""
-    if connection_pool and conn:
-        connection_pool.putconn(conn)
-
-# Database setup for PostgreSQL
+# Database setup for rate limiting and basic analytics
 def init_database():
-    """Initialize PostgreSQL tables"""
-    conn = get_db_connection()
-    if not conn:
-        logger.error("❌ Cannot initialize database - no connection")
-        return False
+    conn = sqlite3.connect(config.db_path)
+    cursor = conn.cursor()
     
-    try:
-        cursor = conn.cursor()
-        
-        # Enable UUID extension
-        cursor.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
-        
-        # Rate limiting table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS rate_limits (
-                user_id VARCHAR(32) PRIMARY KEY,
-                hourly_count INTEGER DEFAULT 0,
-                daily_count INTEGER DEFAULT 0,
-                last_hour_reset TIMESTAMP WITH TIME ZONE,
-                last_day_reset TIMESTAMP WITH TIME ZONE,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # User profiles table (enhanced for analytics)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-                user_id_hash VARCHAR(32) NOT NULL,
-                email_hash VARCHAR(64),
-                current_role TEXT,
-                education_level TEXT,
-                employment_status TEXT,
-                career_goals TEXT,
-                skills_interest TEXT,
-                experience_level TEXT,
-                cost_preference TEXT,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Recommendations table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS recommendations (
-                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-                user_id_hash VARCHAR(32) NOT NULL,
-                session_id VARCHAR(64),
-                recommendation_data JSONB,
-                courses_count INTEGER,
-                success BOOLEAN DEFAULT true,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Analytics table (enhanced)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS analytics (
-                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                user_id_hash VARCHAR(32),
-                session_id VARCHAR(64),
-                career_field TEXT,
-                employment_status TEXT,
-                education_level TEXT,
-                cost_preference TEXT,
-                request_success BOOLEAN,
-                error_message TEXT,
-                processing_time_ms INTEGER,
-                ip_country VARCHAR(10),
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Course interactions table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS course_interactions (
-                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-                user_id_hash VARCHAR(32),
-                course_title TEXT,
-                platform TEXT,
-                action_type VARCHAR(20), -- 'view', 'click', 'search'
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Create indexes for better performance
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_rate_limits_user_id ON rate_limits(user_id);
-            CREATE INDEX IF NOT EXISTS idx_user_profiles_hash ON user_profiles(user_id_hash);
-            CREATE INDEX IF NOT EXISTS idx_recommendations_user ON recommendations(user_id_hash);
-            CREATE INDEX IF NOT EXISTS idx_analytics_timestamp ON analytics(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_analytics_user ON analytics(user_id_hash);
-            CREATE INDEX IF NOT EXISTS idx_course_interactions_user ON course_interactions(user_id_hash);
-        ''')
-        
-        # Create updated_at trigger function
-        cursor.execute('''
-            CREATE OR REPLACE FUNCTION update_updated_at_column()
-            RETURNS TRIGGER AS $$
-            BEGIN
-                NEW.updated_at = CURRENT_TIMESTAMP;
-                RETURN NEW;
-            END;
-            $$ language 'plpgsql';
-        ''')
-        
-        # Apply triggers
-        for table in ['rate_limits', 'user_profiles']:
-            cursor.execute(f'''
-                DROP TRIGGER IF EXISTS update_{table}_updated_at ON {table};
-                CREATE TRIGGER update_{table}_updated_at
-                    BEFORE UPDATE ON {table}
-                    FOR EACH ROW
-                    EXECUTE FUNCTION update_updated_at_column();
-            ''')
-        
-        conn.commit()
-        logger.info("✅ Database initialized successfully")
-        
-        # Log initial stats
-        cursor.execute("SELECT COUNT(*) FROM user_profiles;")
-        user_count = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM recommendations;")
-        recommendation_count = cursor.fetchone()[0]
-        
-        logger.info(f"📊 Database Stats - Users: {user_count}, Recommendations: {recommendation_count}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
-        conn.rollback()
-        return False
-    finally:
-        cursor.close()
-        return_db_connection(conn)
+    # Rate limiting table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            user_id TEXT PRIMARY KEY,
+            hourly_count INTEGER DEFAULT 0,
+            daily_count INTEGER DEFAULT 0,
+            last_hour_reset TIMESTAMP,
+            last_day_reset TIMESTAMP
+        )
+    ''')
+    
+    # Basic analytics (no PII stored)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS analytics (
+            id TEXT PRIMARY KEY,
+            timestamp TIMESTAMP,
+            user_id_hash TEXT,
+            career_field TEXT,
+            employment_status TEXT,
+            request_success BOOLEAN
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
 
-# Enhanced rate limiting with PostgreSQL
+# Rate limiting functions
 def get_user_id(request_info):
     """Generate anonymous user ID based on session"""
-    session_data = str(request_info) + str(time.time() // 3600)
+    # Use a combination of IP-like info (if available) and session
+    session_data = str(request_info) + str(time.time() // 3600)  # Hour-based sessions
     return hashlib.sha256(session_data.encode()).hexdigest()[:16]
 
 def check_rate_limit(user_id):
     """Check if user has exceeded rate limits"""
-    conn = get_db_connection()
-    if not conn:
-        return True, "Database unavailable - allowing request"
+    conn = sqlite3.connect(config.db_path)
+    cursor = conn.cursor()
     
-    try:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        now = datetime.now()
-        
-        # Get or create user rate limit record
-        cursor.execute('SELECT * FROM rate_limits WHERE user_id = %s', (user_id,))
-        record = cursor.fetchone()
-        
-        if not record:
-            # New user
-            cursor.execute('''
-                INSERT INTO rate_limits (user_id, hourly_count, daily_count, last_hour_reset, last_day_reset)
-                VALUES (%s, 1, 1, %s, %s)
-            ''', (user_id, now, now))
-            conn.commit()
-            logger.info(f"🆕 New user created: {user_id[:8]}...")
-            return True, "First request"
-        
-        # Check if counters need reset
-        hourly_count = record['hourly_count']
-        daily_count = record['daily_count']
-        last_hour_reset = record['last_hour_reset']
-        last_day_reset = record['last_day_reset']
-        
-        # Reset hourly counter if needed
-        if now - last_hour_reset > timedelta(hours=1):
-            hourly_count = 0
-            last_hour_reset = now
-        
-        # Reset daily counter if needed
-        if now - last_day_reset > timedelta(days=1):
-            daily_count = 0
-            last_day_reset = now
-        
-        # Check limits
-        if hourly_count >= config.max_requests_per_hour:
-            logger.warning(f"⏰ Hourly limit exceeded for user: {user_id[:8]}...")
-            return False, f"Hourly limit exceeded ({config.max_requests_per_hour}/hour). Try again in {60 - (now - last_hour_reset).seconds // 60} minutes."
-        
-        if daily_count >= config.max_requests_per_day:
-            logger.warning(f"⏰ Daily limit exceeded for user: {user_id[:8]}...")
-            return False, f"Daily limit exceeded ({config.max_requests_per_day}/day). Try again tomorrow."
-        
-        # Update counters
+    now = datetime.now()
+    hour_ago = now - timedelta(hours=1)
+    day_ago = now - timedelta(days=1)
+    
+    # Get or create user rate limit record
+    cursor.execute('SELECT * FROM rate_limits WHERE user_id = ?', (user_id,))
+    record = cursor.fetchone()
+    
+    if not record:
+        # New user
         cursor.execute('''
-            UPDATE rate_limits 
-            SET hourly_count = %s, daily_count = %s, last_hour_reset = %s, last_day_reset = %s
-            WHERE user_id = %s
-        ''', (hourly_count + 1, daily_count + 1, last_hour_reset, last_day_reset, user_id))
-        
+            INSERT INTO rate_limits (user_id, hourly_count, daily_count, last_hour_reset, last_day_reset)
+            VALUES (?, 1, 1, ?, ?)
+        ''', (user_id, now, now))
         conn.commit()
-        logger.info(f"✅ Rate limit check passed for user: {user_id[:8]}... (H: {hourly_count+1}/{config.max_requests_per_hour}, D: {daily_count+1}/{config.max_requests_per_day})")
-        return True, "Request allowed"
-        
-    except Exception as e:
-        logger.error(f"❌ Rate limit check failed: {e}")
-        conn.rollback()
-        return True, "Rate limit check failed - allowing request"
-    finally:
-        cursor.close()
-        return_db_connection(conn)
-
-def save_user_profile(user_id, email, profile_data):
-    """Save user profile to database"""
-    conn = get_db_connection()
-    if not conn:
-        return False
+        conn.close()
+        return True, "First request"
     
-    try:
-        cursor = conn.cursor()
-        user_id_hash = hashlib.sha256(user_id.encode()).hexdigest()[:32]
-        email_hash = hashlib.sha256(email.lower().encode()).hexdigest() if email else None
-        
-        cursor.execute('''
-            INSERT INTO user_profiles (
-                user_id_hash, email_hash, current_role, education_level, employment_status,
-                career_goals, skills_interest, experience_level, cost_preference
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (user_id_hash) DO UPDATE SET
-                current_role = EXCLUDED.current_role,
-                education_level = EXCLUDED.education_level,
-                employment_status = EXCLUDED.employment_status,
-                career_goals = EXCLUDED.career_goals,
-                skills_interest = EXCLUDED.skills_interest,
-                experience_level = EXCLUDED.experience_level,
-                cost_preference = EXCLUDED.cost_preference,
-                updated_at = CURRENT_TIMESTAMP
-        ''', (
-            user_id_hash, email_hash, profile_data.get('current_role'),
-            profile_data.get('education_level'), profile_data.get('employment_status'),
-            profile_data.get('career_goals'), profile_data.get('skills_interest'),
-            profile_data.get('experience_level'), profile_data.get('cost_preference')
-        ))
-        
-        conn.commit()
-        logger.info(f"💾 User profile saved: {user_id[:8]}...")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to save user profile: {e}")
-        conn.rollback()
-        return False
-    finally:
-        cursor.close()
-        return_db_connection(conn)
-
-def log_recommendation(user_id, session_id, recommendation_data, courses_count, success=True):
-    """Log recommendation to database"""
-    conn = get_db_connection()
-    if not conn:
-        return False
+    user_id_db, hourly_count, daily_count, last_hour_reset, last_day_reset = record
     
-    try:
-        cursor = conn.cursor()
-        user_id_hash = hashlib.sha256(user_id.encode()).hexdigest()[:32]
-        
-        cursor.execute('''
-            INSERT INTO recommendations (user_id_hash, session_id, recommendation_data, courses_count, success)
-            VALUES (%s, %s, %s, %s, %s)
-        ''', (user_id_hash, session_id, json.dumps(recommendation_data), courses_count, success))
-        
-        conn.commit()
-        logger.info(f"📝 Recommendation logged: {user_id[:8]}... ({courses_count} courses)")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to log recommendation: {e}")
-        conn.rollback()
-        return False
-    finally:
-        cursor.close()
-        return_db_connection(conn)
-
-def log_analytics(user_id, profile_data, success, error_message=None, processing_time_ms=None):
-    """Enhanced analytics logging"""
-    conn = get_db_connection()
-    if not conn:
-        return False
+    # Parse timestamps
+    last_hour_reset = datetime.fromisoformat(last_hour_reset) if last_hour_reset else hour_ago
+    last_day_reset = datetime.fromisoformat(last_day_reset) if last_day_reset else day_ago
     
-    try:
-        cursor = conn.cursor()
-        user_id_hash = hashlib.sha256(user_id.encode()).hexdigest()[:32]
-        session_id = hashlib.sha256(f"{user_id}{time.time()}".encode()).hexdigest()[:16]
-        
-        cursor.execute('''
-            INSERT INTO analytics (
-                user_id_hash, session_id, career_field, employment_status, 
-                education_level, cost_preference, request_success, error_message, 
-                processing_time_ms
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (
-            user_id_hash, session_id, profile_data.get('current_role'),
-            profile_data.get('employment_status'), profile_data.get('education_level'),
-            profile_data.get('cost_preference'), success, error_message, processing_time_ms
-        ))
-        
-        conn.commit()
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Analytics logging failed: {e}")
-        conn.rollback()
-        return False
-    finally:
-        cursor.close()
-        return_db_connection(conn)
-
-def get_analytics_dashboard():
-    """Get analytics data for monitoring"""
-    conn = get_db_connection()
-    if not conn:
-        return {}
+    # Reset counters if time periods have passed
+    if now - last_hour_reset > timedelta(hours=1):
+        hourly_count = 0
+        last_hour_reset = now
     
-    try:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Today's stats
-        cursor.execute('''
-            SELECT 
-                COUNT(*) as total_requests,
-                COUNT(*) FILTER (WHERE request_success = true) as successful_requests,
-                COUNT(DISTINCT user_id_hash) as unique_users
-            FROM analytics 
-            WHERE timestamp >= CURRENT_DATE
-        ''')
-        today_stats = cursor.fetchone()
-        
-        # Top career fields
-        cursor.execute('''
-            SELECT career_field, COUNT(*) as count
-            FROM analytics 
-            WHERE timestamp >= CURRENT_DATE - INTERVAL '7 days'
-            AND career_field IS NOT NULL
-            GROUP BY career_field
-            ORDER BY count DESC
-            LIMIT 5
-        ''')
-        top_fields = cursor.fetchall()
-        
-        # Employment status distribution
-        cursor.execute('''
-            SELECT employment_status, COUNT(*) as count
-            FROM analytics 
-            WHERE timestamp >= CURRENT_DATE - INTERVAL '7 days'
-            GROUP BY employment_status
-            ORDER BY count DESC
-        ''')
-        employment_dist = cursor.fetchall()
-        
-        logger.info(f"📊 Today's Stats: {today_stats['total_requests']} requests, {today_stats['unique_users']} users")
-        
-        return {
-            'today_stats': today_stats,
-            'top_fields': top_fields,
-            'employment_distribution': employment_dist
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Analytics retrieval failed: {e}")
-        return {}
-    finally:
-        cursor.close()
-        return_db_connection(conn)
+    if now - last_day_reset > timedelta(days=1):
+        daily_count = 0
+        last_day_reset = now
+    
+    # Check limits
+    if hourly_count >= config.max_requests_per_hour:
+        conn.close()
+        return False, f"Hourly limit exceeded ({config.max_requests_per_hour}/hour). Try again in {60 - (now - last_hour_reset).seconds // 60} minutes."
+    
+    if daily_count >= config.max_requests_per_day:
+        conn.close()
+        return False, f"Daily limit exceeded ({config.max_requests_per_day}/day). Try again tomorrow."
+    
+    # Increment counters
+    cursor.execute('''
+        UPDATE rate_limits 
+        SET hourly_count = ?, daily_count = ?, last_hour_reset = ?, last_day_reset = ?
+        WHERE user_id = ?
+    ''', (hourly_count + 1, daily_count + 1, last_hour_reset, last_day_reset, user_id))
+    
+    conn.commit()
+    conn.close()
+    return True, "Request allowed"
+
+def log_analytics(user_id, career_field, employment_status, success):
+    """Log basic analytics without PII"""
+    conn = sqlite3.connect(config.db_path)
+    cursor = conn.cursor()
+    
+    user_id_hash = hashlib.sha256(user_id.encode()).hexdigest()[:16]
+    
+    cursor.execute('''
+        INSERT INTO analytics (id, timestamp, user_id_hash, career_field, employment_status, request_success)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (str(uuid.uuid4()), datetime.now(), user_id_hash, career_field, employment_status, success))
+    
+    conn.commit()
+    conn.close()
 
 # Configure AI model
 try:
     config.validate_api_key()
     genai.configure(api_key=config.api_key)
     model = genai.GenerativeModel("gemini-1.5-flash")
-    logger.info("✅ AI Model configured successfully")
 except Exception as e:
     model = None
-    logger.error(f"❌ AI Model configuration failed: {e}")
+    print(f"AI Model configuration failed: {e}")
 
 MODEL_INSTRUCTIONS = """
 You are a friendly career development advisor for South African learners
@@ -516,6 +191,7 @@ CRITICAL REQUIREMENTS:
 def generate_course_card_html(course_data, index):
     """Generate HTML for a single course card with enhanced security"""
     
+    # Sanitize inputs to prevent XSS
     def sanitize_text(text):
         if not text:
             return ""
@@ -526,6 +202,7 @@ def generate_course_card_html(course_data, index):
     description = sanitize_text(course_data.get('description', 'Great for career development'))
     duration = sanitize_text(course_data.get('duration', 'Duration varies'))
     
+    # Determine cost styling
     cost_raw = course_data.get('cost', '')
     if "free" in str(cost_raw).lower():
         cost_class = "cost-free"
@@ -536,6 +213,7 @@ def generate_course_card_html(course_data, index):
         cost_class = "cost-paid"
         cost_text = sanitize_text(cost_raw) if cost_raw else 'Contact for pricing'
     
+    # Generate safe search URLs (no direct course URLs to avoid broken links)
     search_query = title.replace(' ', '+').replace('&', 'and')
     platform_lower = platform.lower()
     
@@ -610,6 +288,7 @@ def format_courses_response(courses_data):
     if not courses:
         return "<div class='error-message'>❌ No courses found matching your criteria. Please adjust your preferences and try again.</div>"
     
+    # Generate header
     header_html = """
     <div class="recommendations-header">
         <div class="header-content">
@@ -623,10 +302,12 @@ def format_courses_response(courses_data):
     </div>
     """
     
+    # Generate course cards
     cards_html = ""
     for index, course in enumerate(courses):
         cards_html += generate_course_card_html(course, index)
     
+    # Add disclaimer section
     disclaimer_html = """
     <div class="global-disclaimer">
         <h4>📋 Important Information:</h4>
@@ -640,6 +321,7 @@ def format_courses_response(courses_data):
     </div>
     """
     
+    # Enhanced styling with better UX
     full_html = f"""
     <style>
         .recommendations-container {{
@@ -869,10 +551,12 @@ def validate_email(email):
     
     email = email.strip().lower()
     
+    # Basic format validation
     email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     if not re.match(email_pattern, email):
         return False, "Please enter a valid email address (e.g., yourname@example.com)"
     
+    # Block common fake/test emails
     fake_domains = ['test.com', 'example.com', 'fake.com', 'temp.com']
     domain = email.split('@')[1]
     if domain in fake_domains:
@@ -883,9 +567,7 @@ def validate_email(email):
 def chat_with_recommendations(email, currentRole, educationLevel, employmentStatus, 
                             careerGoals, skillsInterest, experienceLevel, costPreference, 
                             history, email_captured_state, request_info=None):
-    """Main function to generate course recommendations with PostgreSQL logging"""
-    
-    start_time = time.time()
+    """Main function to generate course recommendations with security"""
     
     # Validate email
     email_valid, email_msg = validate_email(email)
@@ -906,26 +588,14 @@ def chat_with_recommendations(email, currentRole, educationLevel, employmentStat
     # Generate user ID for rate limiting
     user_id = get_user_id(f"{email}{currentRole}{time.time() // 3600}")
     
-    # Prepare profile data for logging
-    profile_data = {
-        'current_role': currentRole,
-        'education_level': educationLevel,
-        'employment_status': employmentStatus,
-        'career_goals': careerGoals,
-        'skills_interest': skillsInterest,
-        'experience_level': experienceLevel,
-        'cost_preference': costPreference
-    }
-    
     # Check rate limits
     rate_limit_ok, rate_limit_msg = check_rate_limit(user_id)
     if not rate_limit_ok:
-        log_analytics(user_id, profile_data, False, f"Rate limit exceeded: {rate_limit_msg}")
         return f"⏰ {rate_limit_msg}", history, email_captured_state
     
     # Check if AI model is available
     if not model:
-        log_analytics(user_id, profile_data, False, "Google API key not configured")
+        log_analytics(user_id, currentRole, employmentStatus, False)
         return """🔑 **Google API Key Required**
 
 To get course recommendations, you need a Google API key:
@@ -936,9 +606,6 @@ To get course recommendations, you need a Google API key:
 4. Restart the application
 
 Google Gemini offers generous free limits! 🚀""", history, email_captured_state
-
-    # Save user profile
-    save_user_profile(user_id, email, profile_data)
 
     # Create user profile for AI
     user_input = f"""
@@ -957,8 +624,6 @@ Please provide personalized course recommendations as a valid JSON object.
 """
 
     try:
-        logger.info(f"🤖 Generating recommendations for user: {user_id[:8]}...")
-        
         # Generate AI response
         response = model.generate_content(user_input)
         reply = response.text
@@ -975,7 +640,7 @@ Please provide personalized course recommendations as a valid JSON object.
                 courses_data = json.loads(reply)
         
         except json.JSONDecodeError:
-            logger.warning(f"⚠️ JSON parsing failed for user: {user_id[:8]}...")
+            # Fallback with disclaimer
             courses_data = {
                 "courses": [{
                     "title": "Course recommendations available",
@@ -990,32 +655,19 @@ Please provide personalized course recommendations as a valid JSON object.
         # Format response
         formatted_reply = format_courses_response(courses_data)
         
-        # Calculate processing time
-        processing_time_ms = int((time.time() - start_time) * 1000)
-        
-        # Log successful recommendation
-        session_id = hashlib.sha256(f"{user_id}{time.time()}".encode()).hexdigest()[:16]
-        courses_count = len(courses_data.get('courses', []))
-        
-        log_recommendation(user_id, session_id, courses_data, courses_count, True)
-        log_analytics(user_id, profile_data, True, None, processing_time_ms)
+        # Log successful analytics
+        log_analytics(user_id, currentRole, employmentStatus, True)
         
         # Update history
         new_history = history + [{"user_input": user_input, "response": formatted_reply}]
         
-        logger.info(f"✅ Successfully generated {courses_count} recommendations for user: {user_id[:8]}... (took {processing_time_ms}ms)")
-        
         return formatted_reply, new_history, True
 
     except Exception as e:
-        processing_time_ms = int((time.time() - start_time) * 1000)
-        error_msg = str(e)
-        
-        logger.error(f"❌ Recommendation generation failed for user {user_id[:8]}...: {error_msg}")
-        
         # Log failed analytics
-        log_analytics(user_id, profile_data, False, error_msg, processing_time_ms)
+        log_analytics(user_id, currentRole, employmentStatus, False)
         
+        error_msg = str(e)
         if "quota" in error_msg.lower() or "limit" in error_msg.lower():
             return """⏰ **Rate Limit Reached**
 
@@ -1071,59 +723,8 @@ def go_back_to_profile():
     """Reset to initial state"""
     return "<div style='text-align: center; padding: 40px; color: #666;'>Your tailored course recommendations will appear here! ✨</div>"
 
-def get_admin_dashboard():
-    """Get admin dashboard data"""
-    analytics = get_analytics_dashboard()
-    
-    if not analytics:
-        return "Database connection unavailable"
-    
-    dashboard_html = f"""
-    <div style="background: white; padding: 20px; border-radius: 8px; margin: 10px 0;">
-        <h3>📊 Admin Dashboard - Today's Stats</h3>
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 16px 0;">
-            <div style="background: #e3f2fd; padding: 16px; border-radius: 8px; text-align: center;">
-                <h4 style="margin: 0; color: #1976d2;">Total Requests</h4>
-                <p style="font-size: 24px; font-weight: bold; margin: 8px 0; color: #1976d2;">
-                    {analytics.get('today_stats', {}).get('total_requests', 0)}
-                </p>
-            </div>
-            <div style="background: #e8f5e8; padding: 16px; border-radius: 8px; text-align: center;">
-                <h4 style="margin: 0; color: #2e7d32;">Successful</h4>
-                <p style="font-size: 24px; font-weight: bold; margin: 8px 0; color: #2e7d32;">
-                    {analytics.get('today_stats', {}).get('successful_requests', 0)}
-                </p>
-            </div>
-            <div style="background: #fff3e0; padding: 16px; border-radius: 8px; text-align: center;">
-                <h4 style="margin: 0; color: #ef6c00;">Unique Users</h4>
-                <p style="font-size: 24px; font-weight: bold; margin: 8px 0; color: #ef6c00;">
-                    {analytics.get('today_stats', {}).get('unique_users', 0)}
-                </p>
-            </div>
-        </div>
-        
-        <div style="margin-top: 20px;">
-            <h4>🔥 Top Career Fields (Last 7 Days)</h4>
-            <ul>
-    """
-    
-    for field in analytics.get('top_fields', []):
-        dashboard_html += f"<li>{field['career_field']}: {field['count']} requests</li>"
-    
-    dashboard_html += """
-            </ul>
-        </div>
-    </div>
-    """
-    
-    return dashboard_html
-
 # Initialize database
-logger.info("🔄 Initializing database...")
-if init_database():
-    logger.info("✅ Application initialized successfully")
-else:
-    logger.error("❌ Database initialization failed")
+init_database()
 
 # Legal compliance components
 def create_legal_footer():
@@ -1153,15 +754,15 @@ def create_legal_footer():
     </div>
     """)
 
-# Main UI with PostgreSQL integration
-with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Railway PostgreSQL") as demo:
+# Main UI with enhanced security and compliance
+with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Secure") as demo:
     # Session state
     state = gr.State([])
     email_captured = gr.State(False)
     session_email = gr.State("")
     
-    # Header with database status
-    gr.HTML(f"""
+    # Header with compliance notice
+    gr.HTML("""
     <div style="text-align: center; padding: 40px 20px;">
         <div style="width: 80px; height: 80px; background: linear-gradient(135deg, #1e88e5, #26a69a);
                    border-radius: 50%; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;">
@@ -1175,10 +776,6 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Railway Postgre
             AI-powered course recommendations for South African professionals<br>
             <span style="font-size: 0.9em; color: #999;">🔒 Privacy-focused • ⚡ Free to use • 🏆 Trusted sources</span>
         </p>
-        <div style="margin-top: 10px; font-size: 12px; color: {'#4caf50' if connection_pool else '#f44336'};">
-            Database Status: {'🟢 PostgreSQL Connected' if connection_pool else '🔴 Database Offline'}
-            {'• 📊 Railway Hosted' if config.is_production else '• 🔧 Development Mode'}
-        </div>
     </div>
     """)
 
@@ -1191,20 +788,10 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Railway Postgre
         </div>
         <p style="margin: 0; font-size: 14px; color: #1976d2;">
             To ensure fair access: <strong>10 recommendations per hour, 50 per day</strong>. 
-            All usage is tracked in our PostgreSQL database for analytics and optimization.
+            This helps us keep the service free while managing costs.
         </p>
     </div>
     """)
-
-    # Admin dashboard (hidden by default)
-    with gr.Tab("Admin Dashboard", visible=False) as admin_tab:
-        admin_dashboard = gr.HTML(get_admin_dashboard())
-        refresh_dashboard = gr.Button("🔄 Refresh Dashboard")
-        
-        refresh_dashboard.click(
-            fn=get_admin_dashboard,
-            outputs=[admin_dashboard]
-        )
 
     # Profile form
     gr.HTML("""
@@ -1333,7 +920,7 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Railway Postgre
         gr.HTML("""
         <div style="background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 12px; margin-bottom: 16px;">
             <div style="font-size: 13px; color: #856404;">
-                <strong>🔒 Privacy Promise:</strong> Your email is hashed and stored securely in our PostgreSQL database. 
+                <strong>🔒 Privacy Promise:</strong> Your email is only used for this service. 
                 We don't spam, share, or sell your information. You can request deletion anytime.
             </div>
         </div>
@@ -1353,9 +940,12 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Railway Postgre
     # Legal footer
     create_legal_footer()
 
-    # Enhanced CSS
+    # Enhanced CSS with security considerations
     gr.HTML("""
     <style>
+        /* Prevent content injection */
+        * { max-width: 100%; overflow-wrap: break-word; }
+        
         #submit-btn {
             background: linear-gradient(135deg, #1e88e5, #26a69a) !important;
             border: none !important;
@@ -1382,14 +972,59 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Railway Postgre
             background: white !important;
         }
         
+        #modal-email-input input {
+            border: 2px solid #1e88e5 !important;
+            border-radius: 8px !important;
+            background: #f8f9ff !important;
+            transition: border-color 0.2s !important;
+        }
+        
+        #modal-email-input input:focus {
+            border: 2px solid #26a69a !important;
+            box-shadow: 0 0 8px rgba(30, 136, 229, 0.3) !important;
+        }
+        
         .gradio-container {
             max-width: 1000px !important;
             margin: 0 auto !important;
         }
+        
+        /* Rate limiting notice */
+        .rate-limit-warning {
+            background: #ffebee !important;
+            color: #c62828 !important;
+            padding: 12px !important;
+            border-radius: 6px !important;
+            margin: 8px 0 !important;
+            font-size: 14px !important;
+        }
+        
+        /* Success states */
+        .success-message {
+            background: #e8f5e8 !important;
+            color: #2e7d32 !important;
+            padding: 12px !important;
+            border-radius: 6px !important;
+            margin: 8px 0 !important;
+        }
+        
+        /* Security indicators */
+        .security-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 12px;
+            color: #4caf50;
+        }
+        
+        /* Prevent XSS in user inputs */
+        input, textarea {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+        }
     </style>
     """)
 
-    # Event handlers with PostgreSQL logging
+    # Event handlers with enhanced security
     send_btn.click(
         fn=show_email_modal,
         inputs=[currentRole, educationLevel, employmentStatus, careerGoals, 
@@ -1415,35 +1050,18 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Railway Postgre
         outputs=[bot_reply]
     )
 
-# Graceful shutdown handling
-import atexit
-
-def cleanup_connections():
-    """Clean up database connections on shutdown"""
-    global connection_pool
-    if connection_pool:
-        connection_pool.closeall()
-        logger.info("🔌 Database connections closed")
-
-atexit.register(cleanup_connections)
-
-# Launch configuration optimized for Railway
+# Launch configuration with Railway-compatible settings
 if __name__ == "__main__":
-    # Log startup information
-    logger.info("🚀 Starting LWM Course Guide...")
-    logger.info(f"📊 Database: {'PostgreSQL (Railway)' if config.is_production else 'PostgreSQL (Local)'}")
-    logger.info(f"🤖 AI Model: {'Configured' if model else 'Not Available'}")
-    
     demo.launch(
         server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 7860)),
-        share=False,
-        auth=None,
+        server_port=int(os.environ.get("PORT", 7860)),  # Fixed for Railway
+        share=False,  # Set to True only for testing
+        auth=None,  # Add authentication if needed
         ssl_verify=True,
-        show_error=False,
+        show_error=False,  # Don't show detailed errors to users
         favicon_path=None,
         app_kwargs={
-            "docs_url": None,
+            "docs_url": None,  # Disable API docs in production
             "redoc_url": None
         }
     )
