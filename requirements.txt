@@ -1,3 +1,15 @@
 gradio==4.44.1
 google-generativeai==0.8.3
 python-dotenv==1.0.0
+
+# PostgreSQL dependencies
+psycopg2-binary==2.9.9
+psycopg2==2.9.9
+
+# Additional utilities
+requests==2.31.0
+urllib3==2.0.7
+certifi==2023.11.17
+
+# For better logging and monitoring
+structlog==23.2.0
