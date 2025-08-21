@@ -1007,7 +1007,17 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Secure") as dem
             border-radius: 6px !important;
             margin: 8px 0 !important;
         }
-        
+        .footer {
+        display: none !important;
+        }
+
+        .gradio-container .footer {
+        display: none !important;
+        }
+
+        footer {
+        display: none !important;
+        }
         /* Security indicators */
         .security-indicator {
             display: inline-flex;
