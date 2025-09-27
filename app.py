@@ -149,7 +149,7 @@ def log_analytics(user_id, career_field, employment_status, success):
 try:
     config.validate_api_key()
     genai.configure(api_key=config.api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash")
 except Exception as e:
     model = None
     print(f"AI Model configuration failed: {e}")
