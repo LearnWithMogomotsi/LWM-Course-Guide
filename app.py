@@ -1,4 +1,4 @@
-# app.py - Main Application
+# app.py - Main Application with PostgreSQL Support
 import google.generativeai as genai
 from dotenv import load_dotenv
 import gradio as gr
@@ -8,7 +8,6 @@ import json
 import hashlib
 import time
 from datetime import datetime, timedelta
-import sqlite3
 import uuid
 
 # Load environment variables
@@ -20,8 +19,17 @@ class AppConfig:
         self.api_key = os.getenv("GOOGLE_API_KEY")
         self.max_requests_per_hour = 10
         self.max_requests_per_day = 50
-        # Use Railway's ephemeral filesystem safely
-        self.db_path = os.path.join(os.getcwd(), "user_data.db")
+        
+        # Auto-detect database type
+        self.database_url = os.getenv("DATABASE_URL")  # Railway PostgreSQL
+        self.use_postgres = self.database_url is not None
+        
+        if self.use_postgres:
+            print("✓ Using PostgreSQL database")
+        else:
+            print("✓ Using SQLite database (local/development)")
+            self.db_path = os.path.join(os.getcwd(), "user_data.db")
+        
         self.is_production = os.getenv("RAILWAY_ENVIRONMENT") is not None
         
     def validate_api_key(self):
@@ -31,50 +39,81 @@ class AppConfig:
 
 config = AppConfig()
 
-# Ensure database directory exists
-os.makedirs(os.path.dirname(config.db_path) if os.path.dirname(config.db_path) else '.', exist_ok=True)
+# Database connection helper
+def get_db_connection():
+    """Get database connection - PostgreSQL or SQLite"""
+    if config.use_postgres:
+        import psycopg2
+        return psycopg2.connect(config.database_url)
+    else:
+        import sqlite3
+        os.makedirs(os.path.dirname(config.db_path) if os.path.dirname(config.db_path) else '.', exist_ok=True)
+        return sqlite3.connect(config.db_path)
 
 # Database setup for rate limiting and basic analytics
 def init_database():
-    conn = sqlite3.connect(config.db_path)
+    """Initialize database tables - works for both PostgreSQL and SQLite"""
+    conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Rate limiting table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS rate_limits (
-            user_id TEXT PRIMARY KEY,
-            hourly_count INTEGER DEFAULT 0,
-            daily_count INTEGER DEFAULT 0,
-            last_hour_reset TIMESTAMP,
-            last_day_reset TIMESTAMP
-        )
-    ''')
-    
-    # Basic analytics (no PII stored)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS analytics (
-            id TEXT PRIMARY KEY,
-            timestamp TIMESTAMP,
-            user_id_hash TEXT,
-            career_field TEXT,
-            employment_status TEXT,
-            request_success BOOLEAN
-        )
-    ''')
+    if config.use_postgres:
+        # PostgreSQL syntax
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id TEXT PRIMARY KEY,
+                hourly_count INTEGER DEFAULT 0,
+                daily_count INTEGER DEFAULT 0,
+                last_hour_reset TIMESTAMP,
+                last_day_reset TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS analytics (
+                id TEXT PRIMARY KEY,
+                timestamp TIMESTAMP,
+                user_id_hash TEXT,
+                career_field TEXT,
+                employment_status TEXT,
+                request_success BOOLEAN
+            )
+        ''')
+    else:
+        # SQLite syntax
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id TEXT PRIMARY KEY,
+                hourly_count INTEGER DEFAULT 0,
+                daily_count INTEGER DEFAULT 0,
+                last_hour_reset TIMESTAMP,
+                last_day_reset TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS analytics (
+                id TEXT PRIMARY KEY,
+                timestamp TIMESTAMP,
+                user_id_hash TEXT,
+                career_field TEXT,
+                employment_status TEXT,
+                request_success BOOLEAN
+            )
+        ''')
     
     conn.commit()
     conn.close()
+    print("✓ Database initialized successfully")
 
 # Rate limiting functions
 def get_user_id(request_info):
     """Generate anonymous user ID based on session"""
-    # Use a combination of IP-like info (if available) and session
     session_data = str(request_info) + str(time.time() // 3600)  # Hour-based sessions
     return hashlib.sha256(session_data.encode()).hexdigest()[:16]
 
 def check_rate_limit(user_id):
     """Check if user has exceeded rate limits"""
-    conn = sqlite3.connect(config.db_path)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     now = datetime.now()
@@ -82,15 +121,25 @@ def check_rate_limit(user_id):
     day_ago = now - timedelta(days=1)
     
     # Get or create user rate limit record
-    cursor.execute('SELECT * FROM rate_limits WHERE user_id = ?', (user_id,))
+    if config.use_postgres:
+        cursor.execute('SELECT * FROM rate_limits WHERE user_id = %s', (user_id,))
+    else:
+        cursor.execute('SELECT * FROM rate_limits WHERE user_id = ?', (user_id,))
+    
     record = cursor.fetchone()
     
     if not record:
         # New user
-        cursor.execute('''
-            INSERT INTO rate_limits (user_id, hourly_count, daily_count, last_hour_reset, last_day_reset)
-            VALUES (?, 1, 1, ?, ?)
-        ''', (user_id, now, now))
+        if config.use_postgres:
+            cursor.execute('''
+                INSERT INTO rate_limits (user_id, hourly_count, daily_count, last_hour_reset, last_day_reset)
+                VALUES (%s, 1, 1, %s, %s)
+            ''', (user_id, now, now))
+        else:
+            cursor.execute('''
+                INSERT INTO rate_limits (user_id, hourly_count, daily_count, last_hour_reset, last_day_reset)
+                VALUES (?, 1, 1, ?, ?)
+            ''', (user_id, now, now))
         conn.commit()
         conn.close()
         return True, "First request"
@@ -98,8 +147,16 @@ def check_rate_limit(user_id):
     user_id_db, hourly_count, daily_count, last_hour_reset, last_day_reset = record
     
     # Parse timestamps
-    last_hour_reset = datetime.fromisoformat(last_hour_reset) if last_hour_reset else hour_ago
-    last_day_reset = datetime.fromisoformat(last_day_reset) if last_day_reset else day_ago
+    if config.use_postgres:
+        # PostgreSQL returns datetime objects directly
+        if isinstance(last_hour_reset, str):
+            last_hour_reset = datetime.fromisoformat(last_hour_reset)
+        if isinstance(last_day_reset, str):
+            last_day_reset = datetime.fromisoformat(last_day_reset)
+    else:
+        # SQLite returns strings
+        last_hour_reset = datetime.fromisoformat(last_hour_reset) if last_hour_reset else hour_ago
+        last_day_reset = datetime.fromisoformat(last_day_reset) if last_day_reset else day_ago
     
     # Reset counters if time periods have passed
     if now - last_hour_reset > timedelta(hours=1):
@@ -120,11 +177,18 @@ def check_rate_limit(user_id):
         return False, f"Daily limit exceeded ({config.max_requests_per_day}/day). Try again tomorrow."
     
     # Increment counters
-    cursor.execute('''
-        UPDATE rate_limits 
-        SET hourly_count = ?, daily_count = ?, last_hour_reset = ?, last_day_reset = ?
-        WHERE user_id = ?
-    ''', (hourly_count + 1, daily_count + 1, last_hour_reset, last_day_reset, user_id))
+    if config.use_postgres:
+        cursor.execute('''
+            UPDATE rate_limits 
+            SET hourly_count = %s, daily_count = %s, last_hour_reset = %s, last_day_reset = %s
+            WHERE user_id = %s
+        ''', (hourly_count + 1, daily_count + 1, last_hour_reset, last_day_reset, user_id))
+    else:
+        cursor.execute('''
+            UPDATE rate_limits 
+            SET hourly_count = ?, daily_count = ?, last_hour_reset = ?, last_day_reset = ?
+            WHERE user_id = ?
+        ''', (hourly_count + 1, daily_count + 1, last_hour_reset, last_day_reset, user_id))
     
     conn.commit()
     conn.close()
@@ -132,15 +196,21 @@ def check_rate_limit(user_id):
 
 def log_analytics(user_id, career_field, employment_status, success):
     """Log basic analytics without PII"""
-    conn = sqlite3.connect(config.db_path)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     user_id_hash = hashlib.sha256(user_id.encode()).hexdigest()[:16]
     
-    cursor.execute('''
-        INSERT INTO analytics (id, timestamp, user_id_hash, career_field, employment_status, request_success)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (str(uuid.uuid4()), datetime.now(), user_id_hash, career_field, employment_status, success))
+    if config.use_postgres:
+        cursor.execute('''
+            INSERT INTO analytics (id, timestamp, user_id_hash, career_field, employment_status, request_success)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (str(uuid.uuid4()), datetime.now(), user_id_hash, career_field, employment_status, success))
+    else:
+        cursor.execute('''
+            INSERT INTO analytics (id, timestamp, user_id_hash, career_field, employment_status, request_success)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (str(uuid.uuid4()), datetime.now(), user_id_hash, career_field, employment_status, success))
     
     conn.commit()
     conn.close()
@@ -213,7 +283,7 @@ def generate_course_card_html(course_data, index):
         cost_class = "cost-paid"
         cost_text = sanitize_text(cost_raw) if cost_raw else 'Contact for pricing'
     
-    # Generate safe search URLs (no direct course URLs to avoid broken links)
+    # Generate safe search URLs
     search_query = title.replace(' ', '+').replace('&', 'and')
     platform_lower = platform.lower()
     
@@ -596,7 +666,7 @@ def chat_with_recommendations(email, currentRole, educationLevel, employmentStat
     # Check if AI model is available
     if not model:
         log_analytics(user_id, currentRole, employmentStatus, False)
-        return """🔑 **Google API Key Required**
+        return """🔒 **Google API Key Required**
 
 To get course recommendations, you need a Google API key:
 
@@ -724,7 +794,11 @@ def go_back_to_profile():
     return "<div style='text-align: center; padding: 40px; color: #666;'>Your tailored course recommendations will appear here! ✨</div>"
 
 # Initialize database
-init_database()
+try:
+    init_database()
+except Exception as e:
+    print(f"⚠️ Database initialization warning: {e}")
+    print("Application will continue but data may not persist")
 
 # Legal compliance components
 def create_legal_footer():
@@ -753,325 +827,3 @@ def create_legal_footer():
         </div>
     </div>
     """)
-
-# Main UI with enhanced security and compliance
-with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide - Secure") as demo:
-    # Session state
-    state = gr.State([])
-    email_captured = gr.State(False)
-    session_email = gr.State("")
-    
-    # Header with compliance notice
-    gr.HTML("""
-    <div style="text-align: center; padding: 40px 20px;">
-        <div style="width: 80px; height: 80px; background: linear-gradient(135deg, #1e88e5, #26a69a);
-                   border-radius: 50%; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;">
-            <span style="font-size: 30px; color: white;">📚</span>
-        </div>
-        <h1 style="font-size: 3.5em; margin: 0; background: linear-gradient(135deg, #1e88e5, #26a69a);
-                   -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: bold;">
-            LWM Course Guide
-        </h1>
-        <p style="font-size: 1.2em; color: #666; margin-top: 10px;">
-            AI-powered course recommendations for South African professionals<br>
-            <span style="font-size: 0.9em; color: #999;">🔒 Privacy-focused • ⚡ Free to use • 🏆 Trusted sources</span>
-        </p>
-    </div>
-    """)
-
-    # Service limits notice
-    gr.HTML("""
-    <div style="background: #e3f2fd; border-left: 4px solid #1e88e5; padding: 16px; margin: 20px 0; border-radius: 8px;">
-        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
-            <span style="font-size: 16px;">ℹ️</span>
-            <strong style="color: #1565c0;">Service Usage Limits</strong>
-        </div>
-        <p style="margin: 0; font-size: 14px; color: #1976d2;">
-            To ensure fair access: <strong>10 recommendations per hour, 50 per day</strong>. 
-            This helps us keep the service free while managing costs.
-        </p>
-    </div>
-    """)
-
-    # Profile form
-    gr.HTML("""
-    <div style="background: white; border-radius: 15px; padding: 30px; margin: 20px 0; box-shadow: 0 4px 20px rgba(0,0,0,0.1);">
-        <div style="text-align: center; margin-bottom: 30px;">
-            <div style="width: 60px; height: 60px; background: linear-gradient(135deg, #1e88e5, #26a69a);
-                       border-radius: 50%; margin: 0 auto 15px; display: flex; align-items: center; justify-content: center;">
-                <span style="font-size: 24px; color: white;">🎓</span>
-            </div>
-            <h2 style="color: #1e88e5; margin: 0; font-size: 2em;">Career Development Profile</h2>
-            <p style="color: #666; margin: 10px 0 0 0;">
-                Tell us about yourself for personalized recommendations
-            </p>
-        </div>
-    </div>
-    """)
-
-    with gr.Row():
-        with gr.Column():
-            currentRole = gr.Textbox(
-                label="Current Role/Field *",
-                placeholder="e.g., Marketing Assistant, Student, Unemployed",
-                info="Required - helps us recommend relevant skills"
-            )
-            employmentStatus = gr.Dropdown(
-                label="Employment Status",
-                choices=[
-                    "Employed Full-time",
-                    "Employed Part-time", 
-                    "Student",
-                    "Unemployed",
-                    "Freelancer/Self-employed",
-                    "Career Break"
-                ],
-                value=None
-            )
-            costPreference = gr.Dropdown(
-                label="Course Cost Preference",
-                choices=[
-                    "Free courses only",
-                    "Paid courses (up to R500)",
-                    "Paid courses (up to R2000)",
-                    "Any cost if valuable"
-                ],
-                value="Free courses only"
-            )
-        
-        with gr.Column():
-            educationLevel = gr.Dropdown(
-                label="Education Level",
-                choices=[
-                    "Matric/Grade 12",
-                    "Certificate",
-                    "Diploma",
-                    "Bachelor's Degree",
-                    "Honours Degree",
-                    "Master's Degree",
-                    "Doctorate"
-                ],
-                value=None
-            )
-            experienceLevel = gr.Dropdown(
-                label="Experience Level",
-                choices=[
-                    "Entry Level (0-2 years)",
-                    "Mid Level (3-5 years)",
-                    "Senior Level (5+ years)",
-                    "Executive Level"
-                ],
-                value="Entry Level (0-2 years)"
-            )
-            
-    careerGoals = gr.Textbox(
-        label="Career Goals *",
-        placeholder="Describe your career aspirations, target roles, or industries...",
-        lines=2,
-        info="Required - helps us understand your direction"
-    )
-    
-    skillsInterest = gr.Textbox(
-        label="Skills of Interest *",
-        placeholder="e.g., Digital Marketing, Data Analysis, Project Management, Python Programming",
-        info="Required - specific skills you want to develop"
-    )
-
-    # Output section
-    bot_reply = gr.HTML(
-        value="<div style='text-align: center; padding: 40px; color: #666;'>Your tailored course recommendations will appear here! ✨</div>",
-        elem_id="course-output"
-    )
-
-    # Main action button
-    send_btn = gr.Button(
-        "🚀 Get My Course Recommendations",
-        variant="primary",
-        size="lg",
-        elem_id="submit-btn"
-    )
-    
-    # Hidden back button
-    back_btn = gr.Button(
-        "Back to Profile",
-        visible=False,
-        elem_id="back-btn"
-    )
-
-    # Email collection modal
-    with gr.Group(visible=False) as email_modal:
-        gr.HTML("""
-        <div style="background: linear-gradient(135deg, #e3f2fd, #f1f8e9); 
-                   border: 2px solid #1e88e5; border-radius: 15px; padding: 30px; 
-                   margin: 20px 0; box-shadow: 0 4px 15px rgba(30, 136, 229, 0.2);">
-            <div style="text-align: center; margin-bottom: 20px;">
-                <div style="width: 60px; height: 60px; background: linear-gradient(135deg, #1e88e5, #26a69a);
-                           border-radius: 50%; margin: 0 auto 15px; display: flex; align-items: center; justify-content: center;">
-                    <span style="font-size: 24px; color: white;">📧</span>
-                </div>
-                <h2 style="color: #1e88e5; margin: 0; font-size: 1.8em;">Almost There!</h2>
-                <p style="color: #666; margin: 10px 0 0 0; font-size: 14px;">
-                    Enter your email to receive personalized recommendations
-                </p>
-            </div>
-        </div>
-        """)
-        
-        gr.HTML("""
-        <div style="background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 12px; margin-bottom: 16px;">
-            <div style="font-size: 13px; color: #856404;">
-                <strong>🔒 Privacy Promise:</strong> Your email is only used for this service. 
-                We don't spam, share, or sell your information. You can request deletion anytime.
-            </div>
-        </div>
-        """)
-        
-        modal_email = gr.Textbox(
-            label="📧 Your Email Address",
-            placeholder="yourname@example.com",
-            info="Required for personalized recommendations",
-            elem_id="modal-email-input"
-        )
-        
-        with gr.Row():
-            modal_submit = gr.Button("✨ Get My Recommendations", variant="primary", size="lg")
-            modal_cancel = gr.Button("Cancel", variant="secondary")
-
-    # Legal footer
-    create_legal_footer()
-
-    # Enhanced CSS with security considerations
-    gr.HTML("""
-    <style>
-        /* Prevent content injection */
-        * { max-width: 100%; overflow-wrap: break-word; }
-        
-        #submit-btn {
-            background: linear-gradient(135deg, #1e88e5, #26a69a) !important;
-            border: none !important;
-            color: white !important;
-            font-weight: bold !important;
-            padding: 15px 40px !important;
-            border-radius: 10px !important;
-            font-size: 16px !important;
-            margin: 20px 0 !important;
-            width: 100% !important;
-            transition: transform 0.2s !important;
-        }
-        
-        #submit-btn:hover {
-            transform: translateY(-2px) !important;
-            box-shadow: 0 4px 15px rgba(30, 136, 229, 0.3) !important;
-        }
-        
-        #course-output {
-            max-height: 800px !important;
-            overflow-y: auto !important;
-            border: 1px solid #e0e0e0 !important;
-            border-radius: 8px !important;
-            background: white !important;
-        }
-        
-        #modal-email-input input {
-            border: 2px solid #1e88e5 !important;
-            border-radius: 8px !important;
-            background: #f8f9ff !important;
-            transition: border-color 0.2s !important;
-        }
-        
-        #modal-email-input input:focus {
-            border: 2px solid #26a69a !important;
-            box-shadow: 0 0 8px rgba(30, 136, 229, 0.3) !important;
-        }
-        
-        .gradio-container {
-            max-width: 1000px !important;
-            margin: 0 auto !important;
-        }
-        
-        /* Rate limiting notice */
-        .rate-limit-warning {
-            background: #ffebee !important;
-            color: #c62828 !important;
-            padding: 12px !important;
-            border-radius: 6px !important;
-            margin: 8px 0 !important;
-            font-size: 14px !important;
-        }
-        
-        /* Success states */
-        .success-message {
-            background: #e8f5e8 !important;
-            color: #2e7d32 !important;
-            padding: 12px !important;
-            border-radius: 6px !important;
-            margin: 8px 0 !important;
-        }
-        .footer {
-        display: none !important;
-        }
-
-        .gradio-container .footer {
-        display: none !important;
-        }
-
-        footer {
-        display: none !important;
-        }
-        /* Security indicators */
-        .security-indicator {
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-            font-size: 12px;
-            color: #4caf50;
-        }
-        
-        /* Prevent XSS in user inputs */
-        input, textarea {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
-        }
-    </style>
-    """)
-
-    # Event handlers with enhanced security
-    send_btn.click(
-        fn=show_email_modal,
-        inputs=[currentRole, educationLevel, employmentStatus, careerGoals, 
-                skillsInterest, experienceLevel, costPreference, state, 
-                email_captured, session_email],
-        outputs=[bot_reply, state, email_captured, email_modal]
-    )
-    
-    modal_submit.click(
-        fn=submit_email_and_process,
-        inputs=[modal_email, currentRole, educationLevel, employmentStatus, 
-                careerGoals, skillsInterest, experienceLevel, costPreference, state],
-        outputs=[bot_reply, state, email_captured, session_email, email_modal, modal_email]
-    )
-    
-    modal_cancel.click(
-        fn=lambda: (gr.update(visible=False), ""),
-        outputs=[email_modal, modal_email]
-    )
-    
-    back_btn.click(
-        fn=go_back_to_profile,
-        outputs=[bot_reply]
-    )
-
-# Launch configuration with Railway-compatible settings
-if __name__ == "__main__":
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 7860)),  # Fixed for Railway
-        share=False,  # Set to True only for testing
-        auth=None,  # Add authentication if needed
-        ssl_verify=True,
-        show_error=False,  # Don't show detailed errors to users
-        favicon_path=None,
-        app_kwargs={
-            "docs_url": None,  # Disable API docs in production
-            "redoc_url": None
-        }
-    )
