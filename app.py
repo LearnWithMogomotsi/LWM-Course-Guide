@@ -922,49 +922,90 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide") as demo:
 
     # Enhanced CSS
     gr.HTML("""
-    <style>
-        * { max-width: 100%; overflow-wrap: break-word; }
+<style>
+    * { max-width: 100%; overflow-wrap: break-word; }
+    
+    #submit-btn {
+        background: linear-gradient(135deg, #1e88e5, #26a69a) !important;
+        border: none !important;
+        color: white !important;
+        font-weight: bold !important;
+        padding: 15px 40px !important;
+        border-radius: 10px !important;
+        font-size: 16px !important;
+        margin: 20px 0 !important;
+        width: 100% !important;
+        transition: transform 0.2s !important;
+    }
+    
+    #submit-btn:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 4px 15px rgba(30, 136, 229, 0.3) !important;
+    }
+    
+    #course-output {
+        max-height: 800px !important;
+        overflow-y: auto !important;
+        border: 1px solid #e0e0e0 !important;
+        border-radius: 8px !important;
+        background: white !important;
+    }
+    
+    .gradio-container {
+        max-width: 1000px !important;
+        margin: 0 auto !important;
+    }
+    
+    .footer {
+        display: none !important;
+    }
+
+    footer {
+        display: none !important;
+    }
+    
+    /* 📱 MOBILE OPTIMIZATION */
+    @media (max-width: 768px) {
+        .gradio-container {
+            padding: 10px !important;
+            max-width: 100% !important;
+        }
+        
+        h1 {
+            font-size: 2em !important;
+        }
+        
+        p {
+            font-size: 0.95em !important;
+        }
+        
+        .course-card {
+            margin: 10px 5px !important;
+            padding: 15px !important;
+        }
+        
+        .course-title {
+            font-size: 16px !important;
+        }
         
         #submit-btn {
-            background: linear-gradient(135deg, #1e88e5, #26a69a) !important;
-            border: none !important;
-            color: white !important;
-            font-weight: bold !important;
-            padding: 15px 40px !important;
-            border-radius: 10px !important;
-            font-size: 16px !important;
-            margin: 20px 0 !important;
-            width: 100% !important;
-            transition: transform 0.2s !important;
+            padding: 16px 20px !important;
+            font-size: 15px !important;
+        }
+    }
+    
+    @media (max-width: 480px) {
+        h1 {
+            font-size: 1.8em !important;
         }
         
-        #submit-btn:hover {
-            transform: translateY(-2px) !important;
-            box-shadow: 0 4px 15px rgba(30, 136, 229, 0.3) !important;
+        .course-card {
+            padding: 12px !important;
+            margin: 8px 5px !important;
         }
-        
-        #course-output {
-            max-height: 800px !important;
-            overflow-y: auto !important;
-            border: 1px solid #e0e0e0 !important;
-            border-radius: 8px !important;
-            background: white !important;
-        }
-        
-        .gradio-container {
-            max-width: 1000px !important;
-            margin: 0 auto !important;
-        }
-        
-        .footer {
-            display: none !important;
-        }
-
-        footer {
-            display: none !important;
-        }
-    </style>
-    """)
+    }
+</style>
+""")
 
     # Event handlers
     send_btn.click(
