@@ -1,4 +1,4 @@
-# app.py - Main Application with PostgreSQL Support
+# app.py - Main Application with PostgreSQL Support (Email functionality removed)
 import google.generativeai as genai
 from dotenv import load_dotenv
 import gradio as gr
@@ -614,35 +614,10 @@ def format_courses_response(courses_data):
     
     return full_html
 
-def validate_email(email):
-    """Enhanced email validation"""
-    if not email or not email.strip():
-        return False, "Email address is required"
-    
-    email = email.strip().lower()
-    
-    # Basic format validation
-    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    if not re.match(email_pattern, email):
-        return False, "Please enter a valid email address (e.g., yourname@example.com)"
-    
-    # Block common fake/test emails
-    fake_domains = ['test.com', 'example.com', 'fake.com', 'temp.com']
-    domain = email.split('@')[1]
-    if domain in fake_domains:
-        return False, "Please use a real email address"
-    
-    return True, "Valid email"
-
-def chat_with_recommendations(email, currentRole, educationLevel, employmentStatus, 
+def chat_with_recommendations(currentRole, educationLevel, employmentStatus, 
                             careerGoals, skillsInterest, experienceLevel, costPreference, 
-                            history, email_captured_state, request_info=None):
+                            history, request_info=None):
     """Main function to generate course recommendations with security"""
-    
-    # Validate email
-    email_valid, email_msg = validate_email(email)
-    if not email_valid:
-        return f"⚠️ {email_msg}", history, email_captured_state
     
     # Validate required fields
     required_fields = {
@@ -653,20 +628,20 @@ def chat_with_recommendations(email, currentRole, educationLevel, employmentStat
     
     missing_fields = [field for field, value in required_fields.items() if not value or not value.strip()]
     if missing_fields:
-        return f"⚠️ Please fill in the following required fields: {', '.join(missing_fields)}", history, email_captured_state
+        return f"⚠️ Please fill in the following required fields: {', '.join(missing_fields)}", history
     
-    # Generate user ID for rate limiting
-    user_id = get_user_id(f"{email}{currentRole}{time.time() // 3600}")
+    # Generate user ID for rate limiting (using currentRole and skillsInterest instead of email)
+    user_id = get_user_id(f"{currentRole}{skillsInterest}{time.time() // 3600}")
     
     # Check rate limits
     rate_limit_ok, rate_limit_msg = check_rate_limit(user_id)
     if not rate_limit_ok:
-        return f"⏰ {rate_limit_msg}", history, email_captured_state
+        return f"⏰ {rate_limit_msg}", history
     
     # Check if AI model is available
     if not model:
         log_analytics(user_id, currentRole, employmentStatus, False)
-        return """🔒 **Google API Key Required**
+        return """🔑 **Google API Key Required**
 
 To get course recommendations, you need a Google API key:
 
@@ -675,7 +650,7 @@ To get course recommendations, you need a Google API key:
 3. Add it to your .env file as: GOOGLE_API_KEY=your_key_here
 4. Restart the application
 
-Google Gemini offers generous free limits! 🚀""", history, email_captured_state
+Google Gemini offers generous free limits! 🚀""", history
 
     # Create user profile for AI
     user_input = f"""
@@ -731,7 +706,7 @@ Please provide personalized course recommendations as a valid JSON object.
         # Update history
         new_history = history + [{"user_input": user_input, "response": formatted_reply}]
         
-        return formatted_reply, new_history, True
+        return formatted_reply, new_history
 
     except Exception as e:
         # Log failed analytics
@@ -748,7 +723,7 @@ Google Gemini free tier limits reached. Please try again in a few minutes.
 - Check Google Digital Skills for Africa for free options
 - Visit local SETA websites for accredited training
 
-The service will be available again shortly! ⏱️""", history, email_captured_state
+The service will be available again shortly! ⏱️""", history
         else:
             return f"""⚠️ **Service Temporarily Unavailable**
 
@@ -759,35 +734,7 @@ We're experiencing technical difficulties. Please try again in a few minutes.
 - Check Google Digital Skills for Africa
 - Explore local university online offerings
 
-Error details: {error_msg[:100]}...""", history, email_captured_state
-
-def submit_email_and_process(modal_email, currentRole, educationLevel, employmentStatus, 
-                           careerGoals, skillsInterest, experienceLevel, costPreference, history):
-    """Process email submission from modal"""
-    result, new_history, email_captured = chat_with_recommendations(
-        modal_email, currentRole, educationLevel, employmentStatus, careerGoals, 
-        skillsInterest, experienceLevel, costPreference, history, False
-    )
-    
-    return result, new_history, email_captured, modal_email, gr.update(visible=False), ""
-
-def show_email_modal(currentRole, educationLevel, employmentStatus, careerGoals, 
-                    skillsInterest, experienceLevel, costPreference, history, 
-                    email_captured_state, session_email_state):
-    """Show email modal if email not captured, otherwise process directly"""
-    if email_captured_state and session_email_state:
-        return chat_with_recommendations(
-            session_email_state, currentRole, educationLevel, employmentStatus, 
-            careerGoals, skillsInterest, experienceLevel, costPreference, 
-            history, email_captured_state
-        ) + (gr.update(visible=False),)
-    else:
-        return (
-            "<div style='text-align: center; padding: 20px; color: #666;'>Please enter your email to get personalized recommendations.</div>",
-            history, 
-            email_captured_state,
-            gr.update(visible=True)
-        )
+Error details: {error_msg[:100]}...""", history
 
 def go_back_to_profile():
     """Reset to initial state"""
@@ -827,12 +774,11 @@ def create_legal_footer():
         </div>
     </div>
     """)
+
 # Main UI with enhanced security and compliance
 with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide") as demo:
     # Session state
     state = gr.State([])
-    email_captured = gr.State(False)
-    session_email = gr.State("")
     
     # Header with compliance notice
     gr.HTML("""
@@ -971,45 +917,6 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide") as demo:
         elem_id="back-btn"
     )
 
-    # Email collection modal
-    with gr.Group(visible=False) as email_modal:
-        gr.HTML("""
-        <div style="background: linear-gradient(135deg, #e3f2fd, #f1f8e9); 
-                   border: 2px solid #1e88e5; border-radius: 15px; padding: 30px; 
-                   margin: 20px 0; box-shadow: 0 4px 15px rgba(30, 136, 229, 0.2);">
-            <div style="text-align: center; margin-bottom: 20px;">
-                <div style="width: 60px; height: 60px; background: linear-gradient(135deg, #1e88e5, #26a69a);
-                           border-radius: 50%; margin: 0 auto 15px; display: flex; align-items: center; justify-content: center;">
-                    <span style="font-size: 24px; color: white;">📧</span>
-                </div>
-                <h2 style="color: #1e88e5; margin: 0; font-size: 1.8em;">Almost There!</h2>
-                <p style="color: #666; margin: 10px 0 0 0; font-size: 14px;">
-                    Enter your email to receive personalized recommendations
-                </p>
-            </div>
-        </div>
-        """)
-        
-        gr.HTML("""
-        <div style="background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 12px; margin-bottom: 16px;">
-            <div style="font-size: 13px; color: #856404;">
-                <strong>🔒 Privacy Promise:</strong> Your email is only used for this service. 
-                We don't spam, share, or sell your information. You can request deletion anytime.
-            </div>
-        </div>
-        """)
-        
-        modal_email = gr.Textbox(
-            label="📧 Your Email Address",
-            placeholder="yourname@example.com",
-            info="Required for personalized recommendations",
-            elem_id="modal-email-input"
-        )
-        
-        with gr.Row():
-            modal_submit = gr.Button("✨ Get My Recommendations", variant="primary", size="lg")
-            modal_cancel = gr.Button("Cancel", variant="secondary")
-
     # Legal footer
     create_legal_footer()
 
@@ -1044,18 +951,6 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide") as demo:
             background: white !important;
         }
         
-        #modal-email-input input {
-            border: 2px solid #1e88e5 !important;
-            border-radius: 8px !important;
-            background: #f8f9ff !important;
-            transition: border-color 0.2s !important;
-        }
-        
-        #modal-email-input input:focus {
-            border: 2px solid #26a69a !important;
-            box-shadow: 0 0 8px rgba(30, 136, 229, 0.3) !important;
-        }
-        
         .gradio-container {
             max-width: 1000px !important;
             margin: 0 auto !important;
@@ -1073,29 +968,17 @@ with gr.Blocks(theme=gr.themes.Base(), title="LWM Course Guide") as demo:
 
     # Event handlers
     send_btn.click(
-        fn=show_email_modal,
+        fn=chat_with_recommendations,
         inputs=[currentRole, educationLevel, employmentStatus, careerGoals, 
-                skillsInterest, experienceLevel, costPreference, state, 
-                email_captured, session_email],
-        outputs=[bot_reply, state, email_captured, email_modal]
-    )
-    
-    modal_submit.click(
-        fn=submit_email_and_process,
-        inputs=[modal_email, currentRole, educationLevel, employmentStatus, 
-                careerGoals, skillsInterest, experienceLevel, costPreference, state],
-        outputs=[bot_reply, state, email_captured, session_email, email_modal, modal_email]
-    )
-    
-    modal_cancel.click(
-        fn=lambda: (gr.update(visible=False), ""),
-        outputs=[email_modal, modal_email]
+                skillsInterest, experienceLevel, costPreference, state],
+        outputs=[bot_reply, state]
     )
     
     back_btn.click(
         fn=go_back_to_profile,
         outputs=[bot_reply]
     )
+
 
 # 🔥 CRITICAL: Launch configuration for Railway
 if __name__ == "__main__":
@@ -1110,3 +993,8 @@ if __name__ == "__main__":
         share=False,
         show_error=True
     )
+
+
+
+
+ 
